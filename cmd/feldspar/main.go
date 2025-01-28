@@ -10,6 +10,7 @@ import (
 
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
+	"github.com/BurntSushi/toml"
 )
 
 // SSHConfig holds the configuration for the SSH connection
@@ -18,6 +19,13 @@ type SSHConfig struct {
 	Host       string
 	Port       string
 	PrivateKey string
+}
+
+type ForwardConfig struct {
+	RemoteHost string `toml:"remote_host"`
+	RemotePort string `toml:"remote_port"`
+	LocalPort string `toml:"local_port"`
+	SshHost string `toml:"ssh_host"`
 }
 
 // LoadSSHConfig loads the SSH configuration from ~/.ssh/config for a given host
@@ -45,35 +53,55 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	}
 
 	// Get the User, Hostname, Port, and IdentityFile from the SSH config
-	sshConfig.User = cfg.Get(host, "User")
-	sshConfig.Host = cfg.Get(host, "Hostname")
-	port := cfg.Get(host, "Port")
+	sshConfig.User, err = cfg.Get(host, "User")
+	sshConfig.Host, err = cfg.Get(host, "Hostname")
+	port, err := cfg.Get(host, "Port")
 	if port != "" {
 		sshConfig.Port = port
 	}
 
-	identityFile := cfg.Get(host, "IdentityFile")
+	identityFile, err := cfg.Get(host, "IdentityFile")
 	if identityFile == "" {
 		return nil, fmt.Errorf("no IdentityFile specified for host %s in SSH config", host)
 	}
 
 	// Read the private key file
-	privateKeyPath := filepath.Join(homeDir, ".ssh", identityFile)
+	privateKeyPath := identityFile
 	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+	fmt.Errorf("private key: %s", privateKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read private key file: %v", err)
 	}
 	sshConfig.PrivateKey = string(privateKeyBytes)
-
+	fmt.Errorf("private key: %s", sshConfig.PrivateKey)
 	return sshConfig, nil
 }
 
 // ForwardProxy starts a local proxy that forwards traffic to the remote server via SSH
 func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig) error {
-	// Parse the private key
-	signer, err := ssh.ParsePrivateKey([]byte(sshConfig.PrivateKey))
-	if err != nil {
-		return fmt.Errorf("unable to parse private key: %v", err)
+	// Debug: Print the private key content
+	fmt.Println("Private Key Content:")
+	fmt.Println(sshConfig.PrivateKey)
+	var signer ssh.Signer
+	var err error
+	passphrase := os.Getenv("SSH_PASSCODE")
+	if passphrase != "" {
+		// Parse the OpenSSH private key with passphrase
+		parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase([]byte(sshConfig.PrivateKey), []byte(passphrase))
+		if err != nil {
+			return fmt.Errorf("unable to parse raw private key with passphrase: %v", err)
+		}
+		signer, err = ssh.NewSignerFromKey(parsedKey)
+	} else {
+		// Parse the OpenSSH private key without passphrase
+		parsedKey, err := ssh.ParseRawPrivateKey([]byte(sshConfig.PrivateKey))
+		if err != nil {
+			return fmt.Errorf("unable to parse raw private key: %v", err)
+		}
+		signer, err = ssh.NewSignerFromKey(parsedKey)
+		if err != nil {
+			return fmt.Errorf("unable to parse raw private key: %v", err)
+		}
 	}
 
 	// SSH client configuration
@@ -84,6 +112,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Insecure: Use for testing only
 	}
+
 
 	// Connect to the SSH server
 	sshClient, err := ssh.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
@@ -138,18 +167,22 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 }
 
 func main() {
-	// Host name from the SSH config file
-	sshHost := "my-ssh-host" // Replace with the host name defined in ~/.ssh/config
+	var forwardConfig ForwardConfig
+	// Read the TOML file
+	if _, err := toml.DecodeFile("forward_config.toml", &forwardConfig); err != nil {
+		fmt.Println("Error decoding TOML file:", err)
+		return
+	}
+
 
 	// Load SSH configuration from ~/.ssh/config
-	sshConfig, err := LoadSSHConfig(sshHost)
+	sshConfig, err := LoadSSHConfig(forwardConfig.SshHost)
 	if err != nil {
 		log.Fatalf("Failed to load SSH config: %v", err)
 	}
-
 	// Start the forwarding proxy
-	err = ForwardProxy("8080", "remote-server.com", "80", sshConfig)
+	err = ForwardProxy(forwardConfig.LocalPort, forwardConfig.RemoteHost, forwardConfig.RemotePort, sshConfig)
 	if err != nil {
-		log.Fatalf("Failed to start forwarding proxy: %v", err)
+		log.Fatalf("%v", err)
 	}
 }
