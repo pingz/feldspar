@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
@@ -26,6 +27,7 @@ type ForwardConfig struct {
 	RemotePort string `toml:"remote_port"`
 	LocalPort string `toml:"local_port"`
 	SshHost string `toml:"ssh_host"`
+	Timeout int `toml:"timeout"`
 }
 
 // LoadSSHConfig loads the SSH configuration from ~/.ssh/config for a given host
@@ -78,10 +80,7 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 }
 
 // ForwardProxy starts a local proxy that forwards traffic to the remote server via SSH
-func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig) error {
-	// Debug: Print the private key content
-	fmt.Println("Private Key Content:")
-	fmt.Println(sshConfig.PrivateKey)
+func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig, timeout time.Duration) error {
 	var signer ssh.Signer
 	var err error
 	passphrase := os.Getenv("SSH_PASSCODE")
@@ -111,14 +110,26 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			ssh.PublicKeys(signer),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Insecure: Use for testing only
+		Timeout: timeout, // Timeout for the SSH handshake
 	}
 
-
-	// Connect to the SSH server
-	sshClient, err := ssh.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
+	// Create a custom dialer with the tcp timeout
+	dialer := &net.Dialer{
+		Timeout: timeout,
+	}
+	// Establish a TCP connection with the custom dialer
+	tcpConn, err := dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
 	if err != nil {
-		return fmt.Errorf("failed to dial SSH server: %v", err)
+		log.Fatalf("unable to connect to TCP server: %v", err)
 	}
+	defer tcpConn.Close()
+	// Create an SSH client connection using the established TCP connection
+	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
+	if err != nil {
+		log.Fatalf("unable to create SSH client connection: %v", err)
+	}
+	// Connect to the SSH server
+	sshClient := ssh.NewClient(sshConn, chans, reqs)
 	defer sshClient.Close()
 
 	// Start listening on the local port
@@ -137,6 +148,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			log.Printf("failed to accept local connection: %v", err)
 			continue
 		}
+
 
 		// Handle the connection in a goroutine
 		go func(localConn net.Conn) {
@@ -180,8 +192,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load SSH config: %v", err)
 	}
+	timeout := time.Duration(forwardConfig.Timeout) * time.Second
 	// Start the forwarding proxy
-	err = ForwardProxy(forwardConfig.LocalPort, forwardConfig.RemoteHost, forwardConfig.RemotePort, sshConfig)
+	err = ForwardProxy(
+		forwardConfig.LocalPort, forwardConfig.RemoteHost, forwardConfig.RemotePort, sshConfig,
+		timeout,
+	)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
