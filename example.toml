@@ -1,0 +1,5 @@
+remote_host = "remote.host.example"
+remote_port = "80"
+local_port = "8080"
+ssh_host = "host-name-in-ssh-config"
+timeout = 5
