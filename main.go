@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
-	"github.com/BurntSushi/toml"
 )
 
 // SSHConfig holds the configuration for the SSH connection
@@ -25,9 +25,9 @@ type SSHConfig struct {
 type ForwardConfig struct {
 	RemoteHost string `toml:"remote_host"`
 	RemotePort string `toml:"remote_port"`
-	LocalPort string `toml:"local_port"`
-	SshHost string `toml:"ssh_host"`
-	Timeout int `toml:"timeout"`
+	LocalPort  string `toml:"local_port"`
+	SshHost    string `toml:"ssh_host"`
+	Timeout    int    `toml:"timeout"`
 }
 
 // LoadSSHConfig loads the SSH configuration from ~/.ssh/config for a given host
@@ -110,7 +110,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			ssh.PublicKeys(signer),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Insecure: Use for testing only
-		Timeout: timeout, // Timeout for the SSH handshake
+		Timeout:         timeout,                     // Timeout for the SSH handshake
 	}
 
 	// Create a custom dialer with the tcp timeout
@@ -149,7 +149,6 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			continue
 		}
 
-
 		// Handle the connection in a goroutine
 		go func(localConn net.Conn) {
 			defer localConn.Close()
@@ -185,7 +184,6 @@ func main() {
 		fmt.Println("Error decoding TOML file:", err)
 		return
 	}
-
 
 	// Load SSH configuration from ~/.ssh/config
 	sshConfig, err := LoadSSHConfig(forwardConfig.SshHost)
