@@ -1,0 +1,70 @@
+* 前言
+
+这个项目主体是用大模型生成的，写起来真的很快，当然，还是有人工干预解决了一些问题。这个说明文件也是通过大语言模型生成的。实话是比我自己写得好。
+
+* 程序功能概述
+此 Go 程序的主要功能是实现一个本地代理，它可以将本地端口的流量通过 SSH 隧道转发到远程服务器。程序会读取配置文件 forward_config.toml 中的相关配置信息，并从用户的 SSH 配置文件 ~/.ssh/config 中加载 SSH 连接所需的配置，最终启动代理服务。
+
+* 环境准备
+** Go 语言环境
+确保你的系统已经安装了 Go 语言，并且 Go 版本符合程序的要求。
+** 依赖库安装
+该程序依赖于一些第三方库，需要使用以下命令进行安装：
+#+BEGIN_SRC sh
+go get github.com/kevinburke/ssh_config
+go get golang.org/x/crypto/ssh
+go get github.com/BurntSushi/toml
+#+END_SRC
+
+* 配置文件说明
+** SSH 配置文件
+程序会从用户的 SSH 配置文件 ~/.ssh/config 中读取相关配置信息，例如用户名称、主机名、端口号和私钥文件路径等。确保该文件存在且配置正确。
+** 转发配置文件
+程序会读取 forward_config.toml 文件来获取转发的相关配置信息，该文件的内容格式如下：
+#+BEGIN_SRC toml
+remote_host = "远程服务器主机名"
+remote_port = "远程服务器端口号"
+local_port = "本地监听端口号"
+ssh_host = "SSH 服务器主机名"
+timeout = 连接超时时间（秒）
+#+END_SRC
+例如：
+#+BEGIN_SRC toml
+remote_host = "example.com"
+remote_port = "8080"
+local_port = "8081"
+ssh_host = "ssh.example.com"
+timeout = 30
+#+END_SRC
+
+* 私钥文件说明
+** 私钥文件路径配置
+确保在 ~/.ssh/config 中为 ssh_host 配置了正确的 IdentityFile，即 SSH 私钥文件的路径。
+** 私钥密码设置
+如果私钥文件有密码保护，需要设置环境变量 SSH_PASSCODE 为私钥的密码。例如：
+#+BEGIN_SRC sh
+export SSH_PASSCODE="your_passphrase"
+#+END_SRC
+
+* 编译和运行程序
+** 编译程序
+在终端中，进入程序所在的目录，使用以下命令编译程序：
+#+BEGIN_SRC sh
+go build -o ssh_forward main.go
+#+END_SRC
+这将会生成一个名为 ssh_forward 的可执行文件。
+** 运行程序
+编译完成后，使用以下命令运行程序：
+#+BEGIN_SRC sh
+./ssh_forward
+#+END_SRC
+如果一切配置正确，程序将会启动并输出代理服务的相关信息，例如：
+Forwarding proxy started on localhost:8081 -> example.com:8080 via ssh.example.com
+
+* 注意事项
+** 安全性
+程序中使用了 ssh.InsecureIgnoreHostKey() 来忽略 SSH 主机密钥验证，这在测试环境中可以使用，但在生产环境中不建议这样做，因为存在安全风险。
+** 错误处理
+如果程序运行过程中出现错误，会在终端输出相应的错误信息，你可以根据错误信息进行排查和修复。
+
+通过以上步骤，你就可以使用该程序实现本地端口到远程服务器的流量转发。
