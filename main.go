@@ -138,7 +138,7 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Using user: %s")
+	log.Printf("Using user: %s", user)
 	sshConfig.User = user
 
 	// 使用辅助函数获取并设置 Hostname
@@ -154,7 +154,7 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Using port: %s")
+	log.Printf("Using port: %s", port)
 	sshConfig.Port = port
 
 	// 使用辅助函数获取并设置 privateKey
@@ -164,6 +164,9 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	}
 	log.Printf("Using private key: %s", privateKeyPath)
 	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key file: %v", err)
+	}
 	sshConfig.PrivateKey = string(privateKeyBytes)
 	privateKeyBytes = nil
 	return sshConfig, nil
