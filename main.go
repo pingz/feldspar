@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -30,6 +31,85 @@ type ForwardConfig struct {
 	Timeout    int    `toml:"timeout"`
 }
 
+// GetPort retrieves the port number for the given host from the configuration.
+// It returns an error if the port is not a valid number between 22 and 65535.
+func GetPort(cfg *ssh_config.Config, host string) (string, error) {
+	// Try to get the port from the configuration.
+	port, err := cfg.Get(host, "Port")
+	if err != nil {
+		return "", fmt.Errorf("failed to get port for host %s: %v", host, err)
+	}
+
+	// If no port is specified, use the default port 22.
+	if port == "" {
+		port = "22"
+	}
+
+	// Convert the port to an integer.
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return "", fmt.Errorf("invalid port: %s", port)
+	}
+
+	// Validate the port number.
+	if portNum < 22 || portNum > 65535 {
+		return "", fmt.Errorf("port number out of range: %d", portNum)
+	}
+
+	return port, nil
+}
+
+// getSSHConfigValue 从 cfg 中获取指定键的值，并进行错误处理和空值校验
+func getSSHConfigValue(cfg *ssh_config.Config, host, key string) (string, error) {
+	value, err := cfg.Get(host, key)
+	if err != nil {
+		return "", fmt.Errorf("failed to get %s for host %s: %v", key, host, err)
+	}
+	if value == "" {
+		return "", fmt.Errorf("%s for host %s is empty", key, host)
+	}
+	return value, nil
+}
+
+// validatePrivateKeyFile checks if the file exists and is readable.
+// It returns an error if the file is invalid, otherwise it returns nil.
+func validatePrivateKeyFile(path string) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("file does not exist: %s", path)
+	}
+	if err != nil {
+		return fmt.Errorf("error accessing file: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("file is not a regular file: %s", path)
+	}
+	// Check if the file is readable
+	if info.Mode().Perm()&(1<<(uint(7))) == 0 {
+		return fmt.Errorf("file is not readable: %s", path)
+	}
+	// If everything is fine, return nil
+	return nil
+}
+
+// getKeyPath extracts and returns the path to the private key file.
+func getKeyPath(cfg *ssh_config.Config, host string) (string, error) {
+	// 假设私钥路径在配置中的键为 "KeyPath"
+	privateKey, err := getSSHConfigValue(cfg, host, "IdentityFile")
+	if err != nil {
+		return "", err
+	}
+	cleanedPrivateKeyPath := filepath.Clean(privateKey)
+	absPrivateKeyPath, err := filepath.Abs(cleanedPrivateKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	if err := validatePrivateKeyFile(absPrivateKeyPath); err != nil {
+		return "", fmt.Errorf("failed to validate private key: %v", err)
+	}
+	return privateKey, nil
+}
+
 // LoadSSHConfig loads the SSH configuration from ~/.ssh/config for a given host
 func LoadSSHConfig(host string) (*SSHConfig, error) {
 	homeDir, err := os.UserHomeDir()
@@ -48,34 +128,44 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode SSH config file: %v", err)
 	}
+	log.Printf("Loaded SSH config file: %s", configFile)
 
 	sshConfig := &SSHConfig{
-		Host: host,
 		Port: "22", // Default SSH port
 	}
-
-	// Get the User, Hostname, Port, and IdentityFile from the SSH config
-	sshConfig.User, err = cfg.Get(host, "User")
-	sshConfig.Host, err = cfg.Get(host, "Hostname")
-	port, err := cfg.Get(host, "Port")
-	if port != "" {
-		sshConfig.Port = port
-	}
-
-	identityFile, err := cfg.Get(host, "IdentityFile")
-	if identityFile == "" {
-		return nil, fmt.Errorf("no IdentityFile specified for host %s in SSH config", host)
-	}
-
-	// Read the private key file
-	privateKeyPath := identityFile
-	privateKeyBytes, err := os.ReadFile(privateKeyPath)
-	fmt.Errorf("private key: %s", privateKeyPath)
+	// 使用辅助函数获取并设置 User
+	user, err := getSSHConfigValue(cfg, host, "User")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read private key file: %v", err)
+		return nil, err
 	}
+	log.Printf("Using user: %s")
+	sshConfig.User = user
+
+	// 使用辅助函数获取并设置 Hostname
+	hostname, err := getSSHConfigValue(cfg, host, "Hostname")
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Using hostname: %s", hostname)
+
+	sshConfig.Host = hostname
+	// 使用辅助函数获取并设置 Port（允许为空，默认值为 "22"）
+	port, err := GetPort(cfg, host)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Using port: %s")
+	sshConfig.Port = port
+
+	// 使用辅助函数获取并设置 privateKey
+	privateKeyPath, err := getKeyPath(cfg, host)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Using private key: %s", privateKeyPath)
+	privateKeyBytes, err := os.ReadFile(privateKeyPath)
 	sshConfig.PrivateKey = string(privateKeyBytes)
-	fmt.Errorf("private key: %s", sshConfig.PrivateKey)
+	privateKeyBytes = nil
 	return sshConfig, nil
 }
 
@@ -91,6 +181,9 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			return fmt.Errorf("unable to parse raw private key with passphrase: %v", err)
 		}
 		signer, err = ssh.NewSignerFromKey(parsedKey)
+		if err != nil {
+			return fmt.Errorf("unable to parse raw private key: %v", err)
+		}
 	} else {
 		// Parse the OpenSSH private key without passphrase
 		parsedKey, err := ssh.ParseRawPrivateKey([]byte(sshConfig.PrivateKey))
