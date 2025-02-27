@@ -134,7 +134,8 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 		Port: "22", // Default SSH port
 	}
 	// 使用辅助函数获取并设置 User
-	user, err := getSSHConfigValue(cfg, host, "User")
+	var user string
+	user, err = getSSHConfigValue(cfg, host, "User")
 	if err != nil {
 		return nil, err
 	}
