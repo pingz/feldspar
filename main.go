@@ -180,29 +180,25 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 
 // ForwardProxy starts a local proxy that forwards traffic to the remote server via SSH
 func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig, timeout time.Duration) error {
+	// Parse private key with/without passphrase
 	var signer ssh.Signer
-	var err error
 	passphrase := os.Getenv("SSH_PASSCODE")
+	privateKeyBytes := []byte(sshConfig.PrivateKey)
+
+	var parsedKey interface{}
+	var err error
 	if passphrase != "" {
-		// Parse the OpenSSH private key with passphrase
-		parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase([]byte(sshConfig.PrivateKey), []byte(passphrase))
-		if err != nil {
-			return fmt.Errorf("unable to parse raw private key with passphrase: %v", err)
-		}
-		signer, err = ssh.NewSignerFromKey(parsedKey)
-		if err != nil {
-			return fmt.Errorf("unable to parse raw private key: %v", err)
-		}
+		parsedKey, err = ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
 	} else {
-		// Parse the OpenSSH private key without passphrase
-		parsedKey, err := ssh.ParseRawPrivateKey([]byte(sshConfig.PrivateKey))
-		if err != nil {
-			return fmt.Errorf("unable to parse raw private key: %v", err)
-		}
-		signer, err = ssh.NewSignerFromKey(parsedKey)
-		if err != nil {
-			return fmt.Errorf("unable to parse raw private key: %v", err)
-		}
+		parsedKey, err = ssh.ParseRawPrivateKey(privateKeyBytes)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	signer, err = ssh.NewSignerFromKey(parsedKey)
+	if err != nil {
+		return fmt.Errorf("failed to create signer: %v", err)
 	}
 
 	// SSH client configuration
@@ -211,74 +207,70 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Insecure: Use for testing only
-		Timeout:         timeout,                     // Timeout for the SSH handshake
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         timeout,
 	}
 
-	// Create a custom dialer with the tcp timeout
-	dialer := &net.Dialer{
-		Timeout: timeout,
-	}
-	// Establish a TCP connection with the custom dialer
+	// Establish SSH connection
+	dialer := &net.Dialer{Timeout: timeout}
 	tcpConn, err := dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
 	if err != nil {
-		log.Fatalf("unable to connect to TCP server: %v", err)
+		return fmt.Errorf("SSH dial failed (%s:%s): %v", sshConfig.Host, sshConfig.Port, err)
 	}
 	defer tcpConn.Close()
-	// Create an SSH client connection using the established TCP connection
+
 	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
 	if err != nil {
-		log.Fatalf("unable to create SSH client connection: %v", err)
+		return fmt.Errorf("SSH handshake failed: %v", err)
 	}
-	// Connect to the SSH server
 	sshClient := ssh.NewClient(sshConn, chans, reqs)
 	defer sshClient.Close()
 
-	// Start listening on the local port
+	// Start local listener
 	listener, err := net.Listen("tcp", ":"+localPort)
 	if err != nil {
-		return fmt.Errorf("failed to listen on local port: %v", err)
+		return fmt.Errorf("failed to listen on local port %s: %v", localPort, err)
 	}
-
 	defer func() {
 		if err := listener.Close(); err != nil {
-			log.Printf("Error closing listener: %v", err)
+			log.Printf("Error closing listener (port %s): %v", localPort, err)
 		}
 	}()
 
-	log.Printf("Forwarding proxy started on localhost:%s -> %s:%s via %s\n", localPort, remoteHost, remotePort, sshConfig.Host)
+	log.Printf("Forwarding started: localhost:%s -> %s:%s via %s",
+		localPort, remoteHost, remotePort, sshConfig.Host)
 
 	for {
-		// Accept incoming local connections
 		localConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("failed to accept local connection: %v", err)
-			continue
+			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+				log.Printf("Temporary accept error (port %s): %v", localPort, err)
+				continue
+			}
+			return fmt.Errorf("listener accept failed (port %s): %v", localPort, err)
 		}
 
-		// Handle the connection in a goroutine
 		go func(localConn net.Conn) {
 			defer localConn.Close()
 
-			// Establish a connection to the remote server via SSH
 			remoteConn, err := sshClient.Dial("tcp", net.JoinHostPort(remoteHost, remotePort))
 			if err != nil {
-				log.Printf("failed to dial remote server: %v", err)
+				log.Printf("Remote dial failed (%s:%s): %v", remoteHost, remotePort, err)
 				return
 			}
 			defer remoteConn.Close()
 
-			// Copy data between the local and remote connections
+			// Bidirectional data copy
 			go func() {
 				_, err := io.Copy(remoteConn, localConn)
-				if err != nil {
-					log.Printf("error copying data to remote: %v", err)
+				if err != nil && !errors.Is(err, io.EOF) {
+					log.Printf("Local->Remote copy error (%s): %v", localPort, err)
 				}
 			}()
 
 			_, err = io.Copy(localConn, remoteConn)
-			if err != nil {
-				log.Printf("error copying data to local: %v", err)
+			if err != nil && !errors.Is(err, io.EOF) {
+				log.Printf("Remote->Local copy error (%s): %v", localPort, err)
 			}
 		}(localConn)
 	}
