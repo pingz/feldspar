@@ -1,16 +1,16 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"errors"
 	"path/filepath"
 	"strconv"
-	"time"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/kevinburke/ssh_config"
