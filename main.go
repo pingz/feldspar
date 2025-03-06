@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"time"
