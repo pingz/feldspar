@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 	"github.com/kevinburke/ssh_config"
@@ -24,6 +25,10 @@ type SSHConfig struct {
 }
 
 type ForwardConfig struct {
+	Forwards []ForwardRule `toml:"forward"`
+}
+
+type ForwardRule struct {
 	RemoteHost string `toml:"remote_host"`
 	RemotePort string `toml:"remote_port"`
 	LocalPort  string `toml:"local_port"`
@@ -234,7 +239,12 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	if err != nil {
 		return fmt.Errorf("failed to listen on local port: %v", err)
 	}
-	defer listener.Close()
+
+	defer func() {
+		if err := listener.Close(); err != nil {
+			log.Printf("Error closing listener: %v", err)
+		}
+	}()
 
 	log.Printf("Forwarding proxy started on localhost:%s -> %s:%s via %s\n", localPort, remoteHost, remotePort, sshConfig.Host)
 
@@ -275,25 +285,36 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 }
 
 func main() {
-	var forwardConfig ForwardConfig
-	// Read the TOML file
-	if _, err := toml.DecodeFile("forward_config.toml", &forwardConfig); err != nil {
-		fmt.Println("Error decoding TOML file:", err)
-		return
+	var config struct {
+		Forward ForwardConfig `toml:"forward_config"`
 	}
 
-	// Load SSH configuration from ~/.ssh/config
-	sshConfig, err := LoadSSHConfig(forwardConfig.SshHost)
-	if err != nil {
-		log.Fatalf("Failed to load SSH config: %v", err)
+	if _, err := toml.DecodeFile("forward_config.toml", &config); err != nil {
+		log.Fatalf("Error decoding TOML file: %v", err)
 	}
-	timeout := time.Duration(forwardConfig.Timeout) * time.Second
-	// Start the forwarding proxy
-	err = ForwardProxy(
-		forwardConfig.LocalPort, forwardConfig.RemoteHost, forwardConfig.RemotePort, sshConfig,
-		timeout,
-	)
-	if err != nil {
-		log.Fatalf("%v", err)
+
+	var wg sync.WaitGroup
+	for _, rule := range config.Forward.Forwards {
+		wg.Add(1)
+		go func(r ForwardRule) {
+			defer wg.Done()
+
+			sshConfig, err := LoadSSHConfig(r.SshHost)
+			if err != nil {
+				log.Printf("Failed to load SSH config for %s: %v", r.SshHost, err)
+				return
+			}
+
+			timeout := time.Duration(r.Timeout) * time.Second
+			err = ForwardProxy(
+				r.LocalPort, r.RemoteHost, r.RemotePort, sshConfig,
+				timeout,
+			)
+			if err != nil {
+				log.Printf("Forwarding failed for %s:%s: %v", r.RemoteHost, r.RemotePort, err)
+			}
+		}(rule)
 	}
+
+	wg.Wait()
 }

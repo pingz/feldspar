@@ -1,5 +1,14 @@
-remote_host = "remote.host.example"
-remote_port = "80"
-local_port = "8080"
-ssh_host = "host-name-in-ssh-config"
-timeout = 5
+[forward_config]
+[[forward_config.forward]]
+remote_host = "db.internal"
+remote_port = "3306"
+local_port = "13306"
+ssh_host = "bastion"
+timeout = 30
+
+[[forward_config.forward]]
+remote_host = "redis.internal"
+remote_port = "6379"
+local_port = "16379"
+ssh_host = "bastion"
+timeout = 30
