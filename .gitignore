@@ -1,3 +1,4 @@
 forward_config.toml
 feldspar*
 .aider*
+*.log
