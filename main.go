@@ -213,19 +213,30 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	}
 
 	// Establish SSH connection
-	dialer := &net.Dialer{Timeout: timeout}
-	tcpConn, err := dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
-	if err != nil {
-		return fmt.Errorf("SSH dial failed (%s:%s): %v", sshConfig.Host, sshConfig.Port, err)
-	}
-	defer tcpConn.Close()
+	var sshClient *ssh.Client
+	var tcpConn net.Conn
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
-	if err != nil {
-		return fmt.Errorf("SSH handshake failed: %v", err)
+	connect := func() error {
+		dialer := &net.Dialer{Timeout: timeout}
+		var err error
+		tcpConn, err = dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
+		if err != nil {
+			return fmt.Errorf("SSH dial failed (%s:%s): %v", sshConfig.Host, sshConfig.Port, err)
+		}
+
+		sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
+		if err != nil {
+			return fmt.Errorf("SSH handshake failed: %v", err)
+		}
+		sshClient = ssh.NewClient(sshConn, chans, reqs)
+		return nil
 	}
-	sshClient := ssh.NewClient(sshConn, chans, reqs)
+
+	if err := connect(); err != nil {
+		return err
+	}
 	defer sshClient.Close()
+	defer tcpConn.Close()
 
 	// Start local listener
 	listener, err := net.Listen("tcp", ":"+localPort)
@@ -240,6 +251,24 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 
 	log.Printf("Forwarding started: localhost:%s -> %s:%s via %s",
 		localPort, remoteHost, remotePort, sshConfig.Host)
+
+	// Health check and reconnect logic
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, _, err := sshClient.SendRequest("keepalive@feldspar", true, nil); err != nil {
+				log.Printf("Health check failed, attempting to reconnect: %v", err)
+				sshClient.Close()
+				tcpConn.Close()
+				if err := connect(); err != nil {
+					log.Printf("Reconnect failed: %v", err)
+				} else {
+					log.Printf("Reconnected successfully")
+				}
+			}
+		}
+	}()
 
 	for {
 		localConn, err := listener.Accept()
@@ -278,6 +307,14 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 }
 
 func main() {
+	// 设置日志输出到文件
+	logFile, err := os.OpenFile("ssh_forward.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+
 	var config struct {
 		Forward ForwardConfig `toml:"forward_config"`
 	}
