@@ -266,6 +266,8 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 				} else {
 					log.Printf("Reconnected successfully")
 				}
+			} else {
+				log.Printf("Health check log!")
 			}
 		}
 	}()
