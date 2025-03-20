@@ -15,9 +15,10 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
-// SSHConfig holds the configuration for the SSH connection
+// SSHConfig 保存 SSH 连接的配置
 type SSHConfig struct {
 	User       string
 	Host       string
@@ -37,27 +38,22 @@ type ForwardRule struct {
 	Timeout    int    `toml:"timeout"`
 }
 
-// GetPort retrieves the port number for the given host from the configuration.
-// It returns an error if the port is not a valid number between 22 and 65535.
+// GetPort 从配置中获取指定主机的端口号
 func GetPort(cfg *ssh_config.Config, host string) (string, error) {
-	// Try to get the port from the configuration.
 	port, err := cfg.Get(host, "Port")
 	if err != nil {
 		return "", fmt.Errorf("failed to get port for host %s: %v", host, err)
 	}
 
-	// If no port is specified, use the default port 22.
 	if port == "" {
 		port = "22"
 	}
 
-	// Convert the port to an integer.
 	portNum, err := strconv.Atoi(port)
 	if err != nil {
 		return "", fmt.Errorf("invalid port: %s", port)
 	}
 
-	// Validate the port number.
 	if portNum < 22 || portNum > 65535 {
 		return "", fmt.Errorf("port number out of range: %d", portNum)
 	}
@@ -65,7 +61,7 @@ func GetPort(cfg *ssh_config.Config, host string) (string, error) {
 	return port, nil
 }
 
-// getSSHConfigValue 从 cfg 中获取指定键的值，并进行错误处理和空值校验
+// getSSHConfigValue 从配置中获取指定键的值
 func getSSHConfigValue(cfg *ssh_config.Config, host, key string) (string, error) {
 	value, err := cfg.Get(host, key)
 	if err != nil {
@@ -77,8 +73,7 @@ func getSSHConfigValue(cfg *ssh_config.Config, host, key string) (string, error)
 	return value, nil
 }
 
-// validatePrivateKeyFile checks if the file exists and is readable.
-// It returns an error if the file is invalid, otherwise it returns nil.
+// validatePrivateKeyFile 检查私钥文件是否存在且可读
 func validatePrivateKeyFile(path string) error {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
@@ -90,17 +85,14 @@ func validatePrivateKeyFile(path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("file is not a regular file: %s", path)
 	}
-	// Check if the file is readable
 	if info.Mode().Perm()&(1<<(uint(7))) == 0 {
 		return fmt.Errorf("file is not readable: %s", path)
 	}
-	// If everything is fine, return nil
 	return nil
 }
 
-// getKeyPath extracts and returns the path to the private key file.
+// getKeyPath 获取私钥文件的路径
 func getKeyPath(cfg *ssh_config.Config, host string) (string, error) {
-	// 假设私钥路径在配置中的键为 "KeyPath"
 	privateKey, err := getSSHConfigValue(cfg, host, "IdentityFile")
 	if err != nil {
 		return "", err
@@ -116,7 +108,7 @@ func getKeyPath(cfg *ssh_config.Config, host string) (string, error) {
 	return privateKey, nil
 }
 
-// LoadSSHConfig loads the SSH configuration from ~/.ssh/config for a given host
+// LoadSSHConfig 从 ~/.ssh/config 加载指定主机的 SSH 配置
 func LoadSSHConfig(host string) (*SSHConfig, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -137,18 +129,16 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	log.Printf("Loaded SSH config file: %s", configFile)
 
 	sshConfig := &SSHConfig{
-		Port: "22", // Default SSH port
+		Port: "22",
 	}
-	// 使用辅助函数获取并设置 User
-	var user string
-	user, err = getSSHConfigValue(cfg, host, "User")
+
+	user, err := getSSHConfigValue(cfg, host, "User")
 	if err != nil {
 		return nil, err
 	}
 	log.Printf("Using user: %s", user)
 	sshConfig.User = user
 
-	// 使用辅助函数获取并设置 Hostname
 	hostname, err := getSSHConfigValue(cfg, host, "Hostname")
 	if err != nil {
 		return nil, err
@@ -156,7 +146,7 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	log.Printf("Using hostname: %s", hostname)
 
 	sshConfig.Host = hostname
-	// 使用辅助函数获取并设置 Port（允许为空，默认值为 "22"）
+
 	port, err := GetPort(cfg, host)
 	if err != nil {
 		return nil, err
@@ -164,7 +154,6 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	log.Printf("Using port: %s", port)
 	sshConfig.Port = port
 
-	// 使用辅助函数获取并设置 privateKey
 	privateKeyPath, err := getKeyPath(cfg, host)
 	if err != nil {
 		return nil, err
@@ -179,40 +168,66 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	return sshConfig, nil
 }
 
-// ForwardProxy starts a local proxy that forwards traffic to the remote server via SSH
+// ForwardProxy 启动本地代理，通过 SSH 将流量转发到远程服务器
 func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig, timeout time.Duration) error {
-	// Parse private key with/without passphrase
-	var signer ssh.Signer
+	var signers []ssh.Signer
 	passphrase := os.Getenv("SSH_PASSCODE")
 	privateKeyBytes := []byte(sshConfig.PrivateKey)
 
-	var parsedKey interface{}
-	var err error
 	if passphrase != "" {
-		parsedKey, err = ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
+		parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
+		if err != nil {
+			log.Printf("Failed to parse private key with passphrase: %v", err)
+		} else {
+			signer, err := ssh.NewSignerFromKey(parsedKey)
+			if err != nil {
+				log.Printf("Failed to create signer from key: %v", err)
+			} else {
+				signers = append(signers, signer)
+			}
+		}
 	} else {
-		parsedKey, err = ssh.ParseRawPrivateKey(privateKeyBytes)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to parse private key: %v", err)
+		parsedKey, err := ssh.ParseRawPrivateKey(privateKeyBytes)
+		if err != nil {
+			log.Printf("Failed to parse private key: %v", err)
+		} else {
+			signer, err := ssh.NewSignerFromKey(parsedKey)
+			if err != nil {
+				log.Printf("Failed to create signer from key: %v", err)
+			} else {
+				signers = append(signers, signer)
+			}
+		}
 	}
 
-	signer, err = ssh.NewSignerFromKey(parsedKey)
-	if err != nil {
-		return fmt.Errorf("failed to create signer: %v", err)
+	if len(signers) == 0 {
+		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+		if err != nil {
+			return fmt.Errorf("failed to connect to SSH agent: %v", err)
+		}
+		defer sshAgent.Close()
+
+		agentClient := agent.NewClient(sshAgent)
+		agentSigners, err := agentClient.Signers()
+		if err != nil {
+			return fmt.Errorf("failed to get signers from SSH agent: %v", err)
+		}
+		signers = agentSigners
 	}
 
-	// SSH client configuration
+	// SSH 客户端配置
 	config := &ssh.ClientConfig{
 		User: sshConfig.User,
 		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
+			ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+				return signers, nil
+			}),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         timeout,
 	}
 
-	// Establish SSH connection
+	// 建立 SSH 连接
 	var sshClient *ssh.Client
 	var tcpConn net.Conn
 
@@ -238,7 +253,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	defer sshClient.Close()
 	defer tcpConn.Close()
 
-	// Start local listener
+	// 启动本地监听器
 	listener, err := net.Listen("tcp", ":"+localPort)
 	if err != nil {
 		return fmt.Errorf("failed to listen on local port %s: %v", localPort, err)
@@ -252,7 +267,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	log.Printf("Forwarding started: localhost:%s -> %s:%s via %s",
 		localPort, remoteHost, remotePort, sshConfig.Host)
 
-	// Health check and reconnect logic
+	// 健康检查与重连逻辑
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -292,7 +307,6 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			}
 			defer remoteConn.Close()
 
-			// Bidirectional data copy
 			go func() {
 				_, err := io.Copy(remoteConn, localConn)
 				if err != nil && !errors.Is(err, io.EOF) {
@@ -309,7 +323,6 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 }
 
 func main() {
-	// 设置日志输出到文件
 	logFile, err := os.OpenFile("ssh_forward.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
