@@ -24,6 +24,7 @@ type SSHConfig struct {
 	Host       string
 	Port       string
 	PrivateKey string
+	ProxyJump  string
 }
 
 type ForwardConfig struct {
@@ -165,14 +166,20 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	}
 	sshConfig.PrivateKey = string(privateKeyBytes)
 	privateKeyBytes = nil
+
+	proxyJump, err := getSSHConfigValue(cfg, host, "ProxyJump")
+	if err == nil {
+		sshConfig.ProxyJump = proxyJump
+	}
+
 	return sshConfig, nil
 }
 
-// ForwardProxy 启动本地代理，通过 SSH 将流量转发到远程服务器
-func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig, timeout time.Duration) error {
+// createSigners 创建 SSH 签名器
+func createSigners(privateKey string) ([]ssh.Signer, error) {
 	var signers []ssh.Signer
 	passphrase := os.Getenv("SSH_PASSCODE")
-	privateKeyBytes := []byte(sshConfig.PrivateKey)
+	privateKeyBytes := []byte(privateKey)
 
 	if passphrase != "" {
 		parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
@@ -203,57 +210,118 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	if len(signers) == 0 {
 		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
 		if err != nil {
-			return fmt.Errorf("failed to connect to SSH agent: %v", err)
+			return nil, fmt.Errorf("failed to connect to SSH agent: %v", err)
 		}
-		defer sshAgent.Close()
+		// TODO need to close the ssh agent?
+		// defer sshAgent.Close()
 
 		agentClient := agent.NewClient(sshAgent)
 		agentSigners, err := agentClient.Signers()
 		if err != nil {
-			return fmt.Errorf("failed to get signers from SSH agent: %v", err)
+			return nil, fmt.Errorf("failed to get signers from SSH agent: %v", err)
 		}
 		signers = agentSigners
 	}
 
-	// SSH 客户端配置
+	return signers, nil
+}
+
+// createSSHClient 创建 SSH 客户端
+func createSSHClient(sshConfig *SSHConfig, timeout time.Duration) (*ssh.Client, error) {
+	signers, err := createSigners(sshConfig.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signers: %v", err)
+	}
+
 	config := &ssh.ClientConfig{
 		User: sshConfig.User,
 		Auth: []ssh.AuthMethod{
-			ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-				return signers, nil
-			}),
+			ssh.PublicKeys(signers...),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         timeout,
 	}
 
-	// 建立 SSH 连接
-	var sshClient *ssh.Client
-	var tcpConn net.Conn
-
-	connect := func() error {
-		dialer := &net.Dialer{Timeout: timeout}
-		var err error
-		tcpConn, err = dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
-		if err != nil {
-			return fmt.Errorf("SSH dial failed (%s:%s): %v", sshConfig.Host, sshConfig.Port, err)
-		}
-
-		sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
-		if err != nil {
-			return fmt.Errorf("SSH handshake failed: %v", err)
-		}
-		sshClient = ssh.NewClient(sshConn, chans, reqs)
-		return nil
+	dialer := &net.Dialer{Timeout: timeout}
+	tcpConn, err := dialer.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
+	if err != nil {
+		return nil, fmt.Errorf("SSH dial failed (%s:%s): %v", sshConfig.Host, sshConfig.Port, err)
 	}
 
-	if err := connect(); err != nil {
+	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, net.JoinHostPort(sshConfig.Host, sshConfig.Port), config)
+	if err != nil {
+		tcpConn.Close() // 关闭连接以防止资源泄漏
+		return nil, fmt.Errorf("SSH handshake failed: %v", err)
+	}
+
+	return ssh.NewClient(sshConn, chans, reqs), nil
+}
+
+// createSSHClientRecursive 递归创建 SSH 客户端，支持多层 ProxyJump
+func createSSHClientRecursive(sshConfig *SSHConfig, timeout time.Duration, depth int) (*ssh.Client, error) {
+	if depth > 3 {
+		return nil, fmt.Errorf("maximum proxy jump depth exceeded")
+	}
+
+	if sshConfig.ProxyJump == "" {
+		return createSSHClient(sshConfig, timeout)
+	}
+
+	proxyConfig, err := LoadSSHConfig(sshConfig.ProxyJump)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load proxy jump config: %v", err)
+	}
+
+	proxyClient, err := createSSHClientRecursive(proxyConfig, timeout, depth+1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create proxy jump client: %v", err)
+	}
+
+	conn, err := proxyClient.Dial("tcp", net.JoinHostPort(sshConfig.Host, sshConfig.Port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial through proxy jump: %v", err)
+	}
+	// defer conn.Close()
+
+	signers, err := createSigners(sshConfig.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signers: %v", err)
+	}
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(
+		conn, net.JoinHostPort(sshConfig.Host, sshConfig.Port),
+		&ssh.ClientConfig{
+			User: sshConfig.User,
+			Auth: []ssh.AuthMethod{
+				ssh.PublicKeys(signers...),
+			},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         timeout,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish SSH connection through proxy jump: %v", err)
+	}
+
+	client := ssh.NewClient(sshConn, chans, reqs)
+	// // 包装客户端以保持代理连接存活
+	// return &ssh.Client{
+	// 	Conn: client.Conn,
+	// 	Channel: client.Channel,
+	// 	Channels: client.Channels,
+	// 	Requests: client.Requests,
+	// }, nil
+	return client, nil
+}
+
+// ForwardProxy 启动本地代理，通过 SSH 将流量转发到远程服务器
+func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig, timeout time.Duration) error {
+	sshClient, err := createSSHClientRecursive(sshConfig, timeout, 0)
+	if err != nil {
 		return err
 	}
 	defer sshClient.Close()
-	defer tcpConn.Close()
 
-	// 启动本地监听器
 	listener, err := net.Listen("tcp", ":"+localPort)
 	if err != nil {
 		return fmt.Errorf("failed to listen on local port %s: %v", localPort, err)
@@ -267,7 +335,6 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	log.Printf("Forwarding started: localhost:%s -> %s:%s via %s",
 		localPort, remoteHost, remotePort, sshConfig.Host)
 
-	// 健康检查与重连逻辑
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -275,16 +342,20 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 			if _, _, err := sshClient.SendRequest("keepalive@feldspar", true, nil); err != nil {
 				log.Printf("Health check failed, attempting to reconnect: %v", err)
 				sshClient.Close()
-				tcpConn.Close()
-				if err := connect(); err != nil {
-					log.Printf("Reconnect failed: %v", err)
-				} else {
-					log.Printf("Reconnected successfully")
+				sshClient, err = createSSHClientRecursive(sshConfig, timeout, 0)
+				if sshClient == nil {
+					log.Printf("Reconnect failed: cannot create new client")
+					continue
 				}
-			} else {
-				log.Printf("Health check log!")
+				if err != nil {
+					log.Printf("Reconnect failed: %v", err)
+					continue
+				}
+				log.Printf("Reconnected successfully")
 			}
 		}
+		// 防止goroutine泄漏
+		return
 	}()
 
 	for {
