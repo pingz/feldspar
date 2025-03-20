@@ -281,6 +281,7 @@ func createSSHClientRecursive(sshConfig *SSHConfig, timeout time.Duration, depth
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial through proxy jump: %v", err)
 	}
+	// TODO need to release?
 	// defer conn.Close()
 
 	signers, err := createSigners(sshConfig.PrivateKey)
