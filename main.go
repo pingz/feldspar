@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -109,6 +111,23 @@ func getKeyPath(cfg *ssh_config.Config, host string) (string, error) {
 	return privateKey, nil
 }
 
+// getPassphrase 通过 ssh-askpass 获取加密密钥密码
+func getPassphrase() (string, error) {
+	askpass := os.Getenv("SSH_ASKPASS")
+	if askpass == "" {
+		return "", fmt.Errorf("SSH_ASKPASS 环境变量未设置")
+	}
+	cmd := exec.Command(askpass, "Enter passphrase for private key:")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("执行 ssh-askpass 失败: %v", err)
+	}
+	passphrase := strings.TrimSpace(string(output))
+	log.Printf("成功从 ssh-askpass 获取密码")
+	return passphrase, nil
+}
+
+
 // LoadSSHConfig 从 ~/.ssh/config 加载指定主机的 SSH 配置
 func LoadSSHConfig(host string) (*SSHConfig, error) {
 	homeDir, err := os.UserHomeDir()
@@ -177,37 +196,42 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 
 // createSigners 创建 SSH 签名器
 func createSigners(privateKey string) ([]ssh.Signer, error) {
-	var signers []ssh.Signer
-	passphrase := os.Getenv("SSH_PASSCODE")
-	privateKeyBytes := []byte(privateKey)
+	var (
+		signers        []ssh.Signer
+		privateKeyBytes = []byte(privateKey)
+	)
 
-	if passphrase != "" {
-		parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
-		if err != nil {
-			log.Printf("Failed to parse private key with passphrase: %v", err)
-		} else {
+	// 先尝试无密码解析私钥
+	parsedKey, err := ssh.ParseRawPrivateKey(privateKeyBytes)
+	if err == nil {
 			signer, err := ssh.NewSignerFromKey(parsedKey)
 			if err != nil {
-				log.Printf("Failed to create signer from key: %v", err)
+				log.Printf("无法从私钥创建签名器: %v", err)
 			} else {
 				signers = append(signers, signer)
+				return signers, nil
+			}
+	} else if strings.Contains(err.Error(), "passphrase") {
+		// 需要密码，通过 ssh-askpass 获取
+		log.Printf("检测到需要密码的私钥: %v", err)
+		passphrase, err := getPassphrase()
+		if err != nil {
+			log.Printf("获取密码失败: %v", err)
+		} else {
+			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
+			if err != nil {
+				log.Printf("使用密码解析私钥失败: %v", err)
+			} else {
+				signer, err := ssh.NewSignerFromKey(parsedKey)
+				if err != nil {
+					log.Printf("无法从私钥创建签名器: %v", err)
+				} else {
+					signers = append(signers, signer)
+					return signers, nil
+				}
 			}
 		}
 	} else {
-		parsedKey, err := ssh.ParseRawPrivateKey(privateKeyBytes)
-		if err != nil {
-			log.Printf("Failed to parse private key: %v", err)
-		} else {
-			signer, err := ssh.NewSignerFromKey(parsedKey)
-			if err != nil {
-				log.Printf("Failed to create signer from key: %v", err)
-			} else {
-				signers = append(signers, signer)
-			}
-		}
-	}
-
-	if len(signers) == 0 {
 		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to SSH agent: %v", err)
