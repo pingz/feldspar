@@ -7,11 +7,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
-	"sync"
-	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -127,7 +127,6 @@ func getPassphrase() (string, error) {
 	return passphrase, nil
 }
 
-
 // LoadSSHConfig 从 ~/.ssh/config 加载指定主机的 SSH 配置
 func LoadSSHConfig(host string) (*SSHConfig, error) {
 	homeDir, err := os.UserHomeDir()
@@ -197,56 +196,83 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 // createSigners 创建 SSH 签名器
 func createSigners(privateKey string) ([]ssh.Signer, error) {
 	var (
-		signers        []ssh.Signer
+		signers         []ssh.Signer
 		privateKeyBytes = []byte(privateKey)
 	)
 
 	// 先尝试无密码解析私钥
 	parsedKey, err := ssh.ParseRawPrivateKey(privateKeyBytes)
 	if err == nil {
-			signer, err := ssh.NewSignerFromKey(parsedKey)
-			if err != nil {
-				log.Printf("无法从私钥创建签名器: %v", err)
-			} else {
-				signers = append(signers, signer)
-				return signers, nil
-			}
-	} else if strings.Contains(err.Error(), "passphrase") {
-		// 需要密码，通过 ssh-askpass 获取
-		log.Printf("检测到需要密码的私钥: %v", err)
-		passphrase, err := getPassphrase()
+		signer, err := ssh.NewSignerFromKey(parsedKey)
 		if err != nil {
-			log.Printf("获取密码失败: %v", err)
+			log.Printf("无法从私钥创建签名器: %v", err)
 		} else {
-			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
-			if err != nil {
-				log.Printf("使用密码解析私钥失败: %v", err)
-			} else {
-				signer, err := ssh.NewSignerFromKey(parsedKey)
-				if err != nil {
-					log.Printf("无法从私钥创建签名器: %v", err)
-				} else {
-					signers = append(signers, signer)
-					return signers, nil
-				}
-			}
+			signers = append(signers, signer)
+			log.Printf("成功解析未加密私钥")
+			return signers, nil
 		}
-	} else {
-		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to SSH agent: %v", err)
-		}
-		// TODO need to close the ssh agent?
-		// defer sshAgent.Close()
-
-		agentClient := agent.NewClient(sshAgent)
-		agentSigners, err := agentClient.Signers()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get signers from SSH agent: %v", err)
-		}
-		signers = agentSigners
 	}
 
+	// 处理需要密码的情况
+	if strings.Contains(err.Error(), "passphrase") {
+		log.Printf("检测到需要密码的私钥: %v", err)
+
+		// 优先从环境变量获取密码
+		passcode := strings.TrimSpace(os.Getenv("SSH_PASSCODE"))
+		if passcode != "" {
+			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passcode))
+			if err == nil {
+				if signer, err := ssh.NewSignerFromKey(parsedKey); err == nil {
+					signers = append(signers, signer)
+					log.Printf("通过环境变量密码成功解析私钥")
+					return signers, nil
+				} else {
+					log.Printf("从解密私钥创建签名器失败: %v", err)
+				}
+			} else {
+				log.Printf("使用环境变量密码解析私钥失败: %v", err)
+			}
+		} else {
+			log.Printf("环境变量 SSH_PASSCODE 未设置")
+		}
+
+		// 回退到 ssh-askpass 获取密码
+		passphrase, err := getPassphrase()
+		if err == nil {
+			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
+			if err == nil {
+				if signer, err := ssh.NewSignerFromKey(parsedKey); err == nil {
+					signers = append(signers, signer)
+					log.Printf("通过 ssh-askpass 密码成功解析私钥")
+					return signers, nil
+				} else {
+					log.Printf("从解密私钥创建签名器失败: %v", err)
+				}
+			} else {
+				log.Printf("使用 ssh-askpass 密码解析私钥失败: %v", err)
+			}
+		} else {
+			log.Printf("获取 ssh-askpass 密码失败: %v", err)
+		}
+	}
+
+	// 所有方式失败后尝试 SSH Agent
+	log.Printf("尝试通过 SSH Agent 获取签名器")
+	sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+	if err != nil {
+		log.Printf("连接 SSH Agent 失败: %v", err)
+		return nil, fmt.Errorf("连接 SSH Agent 失败: %v", err)
+	}
+	// defer sshAgent.Close()
+
+	agentClient := agent.NewClient(sshAgent)
+	agentSigners, err := agentClient.Signers()
+	if err != nil {
+		log.Printf("从 SSH Agent 获取签名器失败: %v", err)
+		return nil, fmt.Errorf("获取 SSH Agent 签名器失败: %v", err)
+	}
+	signers = append(signers, agentSigners...)
+	log.Printf("从 SSH Agent 获取 %d 个签名器", len(agentSigners))
 	return signers, nil
 }
 
@@ -391,7 +417,7 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 				return nil
 			}
 			log.Printf("Accept error (port %s): %v", localPort, err)
-				continue
+			continue
 		}
 
 		go func(localConn net.Conn) {
