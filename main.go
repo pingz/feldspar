@@ -362,11 +362,12 @@ func ForwardProxy(localPort, remoteHost, remotePort string, sshConfig *SSHConfig
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-				log.Printf("Temporary accept error (port %s): %v", localPort, err)
-				continue
+			if errors.Is(err, net.ErrClosed) {
+				// listener已关闭，正常退出
+				return nil
 			}
-			return fmt.Errorf("listener accept failed (port %s): %v", localPort, err)
+			log.Printf("Accept error (port %s): %v", localPort, err)
+				continue
 		}
 
 		go func(localConn net.Conn) {
