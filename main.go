@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -22,11 +23,12 @@ import (
 
 // SSHConfig 保存 SSH 连接的配置
 type SSHConfig struct {
-	User       string
-	Host       string
-	Port       string
-	PrivateKey string
-	ProxyJump  string
+	User           string
+	Host           string
+	Port           string
+	PrivateKey     string
+	PrivateKeyPath string // 新增私钥路径字段
+	ProxyJump      string
 }
 
 type ForwardConfig struct {
@@ -183,6 +185,7 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 		return nil, fmt.Errorf("failed to read private key file: %v", err)
 	}
 	sshConfig.PrivateKey = string(privateKeyBytes)
+	sshConfig.PrivateKeyPath = privateKeyPath // 保存私钥路径
 	privateKeyBytes = nil
 
 	proxyJump, err := getSSHConfigValue(cfg, host, "ProxyJump")
@@ -193,92 +196,142 @@ func LoadSSHConfig(host string) (*SSHConfig, error) {
 	return sshConfig, nil
 }
 
-// createSigners 创建 SSH 签名器
-func createSigners(privateKey string) ([]ssh.Signer, error) {
-	var (
-		signers         []ssh.Signer
-		privateKeyBytes = []byte(privateKey)
-	)
+// getPublicKey 获取私钥对应的公钥
+func getPublicKey(privateKeyPath string) (ssh.PublicKey, error) {
+	// 尝试读取同名的.pub文件
+	pubKeyPath := privateKeyPath + ".pub"
+	pubKeyBytes, err := os.ReadFile(pubKeyPath)
+	if err == nil {
+		pubKey, _, _, _, err := ssh.ParseAuthorizedKey(pubKeyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("解析公钥文件失败: %v", err)
+		}
+		return pubKey, nil
+	}
 
-	// 先尝试无密码解析私钥
+	// 从私钥内容解析公钥
+	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取私钥失败: %v", err)
+	}
+
+	// 尝试解析未加密的私钥
+	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
+	if err == nil {
+		return signer.PublicKey(), nil
+	}
+
+	// 处理加密私钥
+	if strings.Contains(err.Error(), "passphrase") {
+		// 尝试环境变量密码
+		passcode := os.Getenv("SSH_PASSCODE")
+		if passcode != "" {
+			signer, err := ssh.ParsePrivateKeyWithPassphrase(privateKeyBytes, []byte(passcode))
+			if err == nil {
+				return signer.PublicKey(), nil
+			}
+		}
+
+		// 尝试通过ssh-askpass获取密码
+		passphrase, err := getPassphrase()
+		if err == nil {
+			signer, err := ssh.ParsePrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
+			if err == nil {
+				return signer.PublicKey(), nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("无法获取公钥: %v", err)
+}
+
+// getAgentSigners 从SSH Agent获取匹配的签名器
+func getAgentSigners(privateKeyPath string) ([]ssh.Signer, error) {
+	agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+	if err != nil {
+		return nil, fmt.Errorf("连接SSH Agent失败: %v", err)
+	}
+	// defer agentConn.Close()
+
+	agentClient := agent.NewClient(agentConn)
+	agentSigners, err := agentClient.Signers()
+	if err != nil {
+		return nil, fmt.Errorf("获取Agent签名器失败: %v", err)
+	}
+
+	// 获取目标公钥
+	targetPubKey, err := getPublicKey(privateKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("无法获取目标公钥: %v", err)
+	}
+
+	// 匹配公钥
+	var matched []ssh.Signer
+	for _, s := range agentSigners {
+		if bytes.Equal(s.PublicKey().Marshal(), targetPubKey.Marshal()) {
+			matched = append(matched, s)
+		}
+	}
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("Agent中未找到匹配的公钥")
+	}
+	return matched, nil
+}
+
+// createSigners 创建 SSH 签名器（优先使用Agent）
+func createSigners(sshConfig *SSHConfig) ([]ssh.Signer, error) {
+	// 1. 优先尝试从SSH Agent获取匹配的签名器
+	if agentSigners, err := getAgentSigners(sshConfig.PrivateKeyPath); err == nil {
+		log.Printf("从SSH Agent获取到%d个匹配的签名器", len(agentSigners))
+		return agentSigners, nil
+	} else {
+		log.Printf("SSH Agent未提供匹配签名器: %v", err)
+	}
+
+	// 2. 回退到加载私钥文件
+	privateKeyBytes := []byte(sshConfig.PrivateKey)
+
+	// 尝试无密码解析
 	parsedKey, err := ssh.ParseRawPrivateKey(privateKeyBytes)
 	if err == nil {
 		signer, err := ssh.NewSignerFromKey(parsedKey)
 		if err != nil {
-			log.Printf("无法从私钥创建签名器: %v", err)
+			log.Printf("无法创建签名器: %v", err)
 		} else {
-			signers = append(signers, signer)
-			log.Printf("成功解析未加密私钥")
-			return signers, nil
+			log.Printf("成功加载未加密私钥")
+			return []ssh.Signer{signer}, nil
 		}
 	}
 
-	// 处理需要密码的情况
+	// 处理加密私钥
 	if strings.Contains(err.Error(), "passphrase") {
-		log.Printf("检测到需要密码的私钥: %v", err)
-
-		// 优先从环境变量获取密码
-		passcode := strings.TrimSpace(os.Getenv("SSH_PASSCODE"))
-		if passcode != "" {
+		// 尝试环境变量密码
+		if passcode := os.Getenv("SSH_PASSCODE"); passcode != "" {
 			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passcode))
 			if err == nil {
-				if signer, err := ssh.NewSignerFromKey(parsedKey); err == nil {
-					signers = append(signers, signer)
-					log.Printf("通过环境变量密码成功解析私钥")
-					return signers, nil
-				} else {
-					log.Printf("从解密私钥创建签名器失败: %v", err)
-				}
-			} else {
-				log.Printf("使用环境变量密码解析私钥失败: %v", err)
+				signer, _ := ssh.NewSignerFromKey(parsedKey)
+				return []ssh.Signer{signer}, nil
 			}
-		} else {
-			log.Printf("环境变量 SSH_PASSCODE 未设置")
 		}
 
-		// 回退到 ssh-askpass 获取密码
+		// 尝试ssh-askpass
 		passphrase, err := getPassphrase()
 		if err == nil {
 			parsedKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privateKeyBytes, []byte(passphrase))
 			if err == nil {
-				if signer, err := ssh.NewSignerFromKey(parsedKey); err == nil {
-					signers = append(signers, signer)
-					log.Printf("通过 ssh-askpass 密码成功解析私钥")
-					return signers, nil
-				} else {
-					log.Printf("从解密私钥创建签名器失败: %v", err)
-				}
-			} else {
-				log.Printf("使用 ssh-askpass 密码解析私钥失败: %v", err)
+				signer, _ := ssh.NewSignerFromKey(parsedKey)
+				return []ssh.Signer{signer}, nil
 			}
-		} else {
-			log.Printf("获取 ssh-askpass 密码失败: %v", err)
 		}
 	}
 
-	// 所有方式失败后尝试 SSH Agent
-	log.Printf("尝试通过 SSH Agent 获取签名器")
-	sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
-	if err != nil {
-		log.Printf("连接 SSH Agent 失败: %v", err)
-		return nil, fmt.Errorf("连接 SSH Agent 失败: %v", err)
-	}
-	// defer sshAgent.Close()
-
-	agentClient := agent.NewClient(sshAgent)
-	agentSigners, err := agentClient.Signers()
-	if err != nil {
-		log.Printf("从 SSH Agent 获取签名器失败: %v", err)
-		return nil, fmt.Errorf("获取 SSH Agent 签名器失败: %v", err)
-	}
-	signers = append(signers, agentSigners...)
-	log.Printf("从 SSH Agent 获取 %d 个签名器", len(agentSigners))
-	return signers, nil
+	// 所有方式失败
+	return nil, fmt.Errorf("无法加载私钥")
 }
 
 // createSSHClient 创建 SSH 客户端
 func createSSHClient(sshConfig *SSHConfig, timeout time.Duration) (*ssh.Client, error) {
-	signers, err := createSigners(sshConfig.PrivateKey)
+	signers, err := createSigners(sshConfig) // 此处改为传入整个配置
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signers: %v", err)
 	}
@@ -334,7 +387,7 @@ func createSSHClientRecursive(sshConfig *SSHConfig, timeout time.Duration, depth
 	// TODO need to release?
 	// defer conn.Close()
 
-	signers, err := createSigners(sshConfig.PrivateKey)
+	signers, err := createSigners(sshConfig) // 此处改为传入整个配置
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signers: %v", err)
 	}
