@@ -4,3 +4,7 @@ feldspar*
 *.log
 *.diff
 *.patch
+*.log.*
+*.go.mod
+*.go.orig
+*.
